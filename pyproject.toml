@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=65.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "robot_framework"
+version = "0.0.1"
+authors = [
+  { name="ITK Development", email="itk-rpa@mkb.aarhus.dk" },
+]
+readme = "README.md"
+requires-python = ">=3.11"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: Microsoft :: Windows",
+]
+dependencies = [
+    "OpenOrchestrator == 2.*",
+    "Pillow == 10.*",
+    "azure-cosmos==4.15.0"
+    "pyproj==3.7.2"
+    "regex==2026.4.4"
+    "requests==2.33.1"
+]
+
+[project.optional-dependencies]
+dev = [
+  "pylint",
+  "flake8"
+]
