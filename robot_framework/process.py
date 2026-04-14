@@ -19,15 +19,6 @@ CVR_API_URL = "https://cvrapi.dk/api"
 USER_AGENT = "AAK Tilsyn"
 DEPOT = (56.161147, 10.13455)
 
-APP_FIELDS_TO_PRESERVE = {
-    "hidden",
-    "last_inspected_at",
-    "last_inspector_email",
-    "inspection_comment",
-    "inspections",
-    "AuditLog",
-}
-
 DEPOT_NEAR_ALLOWED_ADDRESS_PARTS = [
     "karen blixens",
     "edwin rahrs vej",
@@ -66,7 +57,6 @@ def process(orchestrator_connection: OrchestratorConnection, queue_element: Queu
     created = 0
     updated = 0
     unchanged = 0
-    skipped = 0
 
     # -------------------------
     # PEZ / henstillinger
@@ -116,70 +106,74 @@ def process(orchestrator_connection: OrchestratorConnection, queue_element: Queu
                     fallback_lon=existing.get("longitude") if existing else None,
                 )
 
-            end_date = None
-            if existing and existing.get("end_date"):
-                end_date = existing.get("end_date")
-            else:
-                end_date = case["start_date"]
-
-            doc = {
-                "id": doc_id,
+            content_hash = make_hash({
                 "type": "henstilling",
-
                 "HenstillingId": case["henstilling_id"],
                 "PEZUUID": case["case_uuid"],
                 "ForseelseNr": forseelse["nummer"],
                 "Forseelse": forseelse["text"],
-
                 "CVR": case["cvr"],
                 "FirmaNavn": company_name,
-
-                "street_name": street_name,
                 "full_address": case["full_address"],
-                "latitude": latitude,
-                "longitude": longitude,
-
                 "start_date": case["start_date"],
-                "end_date": end_date,
-
-                "Kvadratmeter": existing.get("Kvadratmeter") if existing else None,
-                "Tilladelsestype": (
-                    existing.get("Tilladelsestype")
-                    if existing and existing.get("Tilladelsestype") is not None
-                    else forseelse["tilladelsestype"]
-                ),
-                "FakturaStatus": existing.get("FakturaStatus") if existing else "Ny",
-
                 "location_hash": location_hash,
-            }
-
-            doc["content_hash"] = make_hash({
-                "type": doc["type"],
-                "HenstillingId": doc["HenstillingId"],
-                "PEZUUID": doc["PEZUUID"],    "ForseelseNr": doc["ForseelseNr"],
-                "Forseelse": doc["Forseelse"],
-                "CVR": doc["CVR"],
-                "FirmaNavn": doc["FirmaNavn"],
-                "full_address": doc["full_address"],
-                "start_date": doc["start_date"],
-                # Vi fjerner end_date, Kvadratmeter og FakturaStatus herfra
-                "location_hash": doc["location_hash"],
             })
 
-            result = upsert_if_changed(
-                container=container,
-                existing=existing,
-                fresh=doc,
-                preserve_fields=APP_FIELDS_TO_PRESERVE,
-            )
+            if existing:
+                if existing.get("content_hash") == content_hash:
+                    unchanged += 1
+                    continue
 
-            if result == "created":
+                # Only patch sync-owned fields — never touch app fields
+                sync_fields = {
+                    "HenstillingId": case["henstilling_id"],
+                    "PEZUUID": case["case_uuid"],
+                    "ForseelseNr": forseelse["nummer"],
+                    "Forseelse": forseelse["text"],
+                    "CVR": case["cvr"],
+                    "FirmaNavn": company_name,
+                    "street_name": street_name,
+                    "full_address": case["full_address"],
+                    "latitude": latitude,
+                    "longitude": longitude,
+                    "start_date": case["start_date"],
+                    "location_hash": location_hash,
+                    "content_hash": content_hash,
+                }
+
+                # Only set Tilladelsestype if it hasn't been set yet
+                if existing.get("Tilladelsestype") is None:
+                    sync_fields["Tilladelsestype"] = forseelse["tilladelsestype"]
+
+                patch_in_batches(container, doc_id, sync_fields)
+                updated += 1
+
+            else:
+                # New doc — set everything including app-field defaults
+                doc = {
+                    "id": doc_id,
+                    "type": "henstilling",
+                    "HenstillingId": case["henstilling_id"],
+                    "PEZUUID": case["case_uuid"],
+                    "ForseelseNr": forseelse["nummer"],
+                    "Forseelse": forseelse["text"],
+                    "CVR": case["cvr"],
+                    "FirmaNavn": company_name,
+                    "street_name": street_name,
+                    "full_address": case["full_address"],
+                    "latitude": latitude,
+                    "longitude": longitude,
+                    "start_date": case["start_date"],
+                    "end_date": case["start_date"],
+                    "Kvadratmeter": None,
+                    "Tilladelsestype": forseelse["tilladelsestype"],
+                    "FakturaStatus": "Ny",
+                    "location_hash": location_hash,
+                    "content_hash": content_hash,
+                }
+                container.upsert_item(body=doc)
                 created += 1
                 case_created_new_rows = True
-            elif result == "updated":
-                updated += 1
-            else:
-                unchanged += 1
 
         if not case_had_existing_rows and case_created_new_rows:
             add_sent_to_tilsyn_comment(
@@ -227,106 +221,119 @@ def process(orchestrator_connection: OrchestratorConnection, queue_element: Queu
                 fallback_lon=existing.get("longitude") if existing else None,
             )
 
-        doc = {
-            "id": doc_id,
+        content_hash = make_hash({
             "type": "permission",
-
             "case_number": case["case_number"],
             "case_id": case["case_id"],
             "vejman_state": case["vejman_state"],
             "connected_case": case["connected_case"],
-
             "start_date": case["start_date"],
             "end_date": case["end_date"],
-
             "applicant": case["applicant"],
-            "marker": case["marker"],
             "rovm_equipment_type": case["rovm_equipment_type"],
-            "applicant_folder_number": case["applicant_folder_number"],
-            "authority_reference_number": case["authority_reference_number"],
-
-            "street_status": case["street_status"],
-            "street_name": street_name,
             "full_address": case["full_address"],
-
-            "initials": case["initials"],
-            "latitude": latitude,
-            "longitude": longitude,
-
             "location_hash": location_hash,
-        }
-
-        doc["content_hash"] = make_hash({
-            "type": doc["type"],
-            "case_number": doc["case_number"],
-            "case_id": doc["case_id"],
-            "vejman_state": doc["vejman_state"],
-            "connected_case": doc["connected_case"],
-            "start_date": doc["start_date"],
-            "end_date": doc["end_date"],
-            "applicant": doc["applicant"],
-            "rovm_equipment_type": doc["rovm_equipment_type"],
-            "full_address": doc["full_address"],
-            "location_hash": doc["location_hash"],
         })
 
-        result = upsert_if_changed(
-            container=container,
-            existing=existing,
-            fresh=doc,
-            preserve_fields=APP_FIELDS_TO_PRESERVE,
-        )
+        if existing:
+            if existing.get("content_hash") == content_hash:
+                unchanged += 1
+                continue
 
-        if result == "created":
-            created += 1
-        elif result == "updated":
+            sync_fields = {
+                "case_number": case["case_number"],
+                "case_id": case["case_id"],
+                "vejman_state": case["vejman_state"],
+                "connected_case": case["connected_case"],
+                "start_date": case["start_date"],
+                "end_date": case["end_date"],
+                "applicant": case["applicant"],
+                "marker": case["marker"],
+                "rovm_equipment_type": case["rovm_equipment_type"],
+                "applicant_folder_number": case["applicant_folder_number"],
+                "authority_reference_number": case["authority_reference_number"],
+                "street_status": case["street_status"],
+                "street_name": street_name,
+                "full_address": case["full_address"],
+                "initials": case["initials"],
+                "latitude": latitude,
+                "longitude": longitude,
+                "location_hash": location_hash,
+                "content_hash": content_hash,
+            }
+
+            patch_in_batches(container, doc_id, sync_fields)
             updated += 1
+
         else:
-            unchanged += 1
+            doc = {
+                "id": doc_id,
+                "type": "permission",
+                "case_number": case["case_number"],
+                "case_id": case["case_id"],
+                "vejman_state": case["vejman_state"],
+                "connected_case": case["connected_case"],
+                "start_date": case["start_date"],
+                "end_date": case["end_date"],
+                "applicant": case["applicant"],
+                "marker": case["marker"],
+                "rovm_equipment_type": case["rovm_equipment_type"],
+                "applicant_folder_number": case["applicant_folder_number"],
+                "authority_reference_number": case["authority_reference_number"],
+                "street_status": case["street_status"],
+                "street_name": street_name,
+                "full_address": case["full_address"],
+                "initials": case["initials"],
+                "latitude": latitude,
+                "longitude": longitude,
+                "location_hash": location_hash,
+                "content_hash": content_hash,
+            }
+            container.upsert_item(body=doc)
+            created += 1
 
     orchestrator_connection.log_info(
-        f"Unified sync done. Created={created}, Updated={updated}, Unchanged={unchanged}, Skipped={skipped}"
+        f"Unified sync done. Created={created}, Updated={updated}, Unchanged={unchanged}"
     )
 
 
-def upsert_if_changed(container, existing: dict | None, fresh: dict, preserve_fields: set[str]) -> str:
-    if existing and existing.get("content_hash") == fresh.get("content_hash"):
-        return "unchanged"
+def patch_in_batches(container, doc_id: str, fields: dict):
+    """Patch only the given fields on an existing Cosmos doc.
+    Cosmos limits patch to 10 operations per call, so we batch.
+    content_hash is always placed in the last batch — if an earlier
+    batch fails, the old hash remains and the next sync retries."""
+    from azure.cosmos import PatchOperations
 
-    final_doc = {}
-    if existing:
-        for key in preserve_fields:
-            if key in existing:
-                final_doc[key] = existing[key]
+    # Ensure content_hash goes last
+    items = [(k, v) for k, v in fields.items() if k != "content_hash"]
+    if "content_hash" in fields:
+        items.append(("content_hash", fields["content_hash"]))
 
-    final_doc.update(fresh)
-    container.upsert_item(body=final_doc)
-
-    return "updated" if existing else "created"
+    for i in range(0, len(items), 10):
+        batch = items[i:i + 10]
+        ops = PatchOperations()
+        for key, value in batch:
+            ops.set(f"/{key}", value)
+        container.patch_item(item=doc_id, partition_key=doc_id, patch_operations=ops)
 
 
 def normalize_street_name(text: str | None) -> str | None:
     if not text:
         return None
-
     value = str(text).strip()
     value = value.split(" - ", 1)[0].strip()
-
     match = re.search(r"\d", value)
     if match:
         value = value[:match.start()].strip()
-
     return value or None
 
 
 def clean_address_for_geocoding(text: str | None) -> str | None:
     if not text:
         return None
-
     value = str(text).strip()
     value = value.split(" - ", 1)[0].strip()
     value = re.sub(r"(\d+[A-Za-z]?)-\d+[A-Za-z]?", r"\1", value)
-
     return value or None
 
 
@@ -334,7 +341,6 @@ def resolve_coordinates(full_address: str | None, source_lat, source_lon, fallba
     if source_lat is not None and source_lon is not None:
         if not is_too_close_to_depot(source_lat, source_lon):
             return source_lat, source_lon
-
         if is_known_valid_depot_area_address(full_address):
             return source_lat, source_lon
 
@@ -349,15 +355,10 @@ def resolve_coordinates(full_address: str | None, source_lat, source_lon, fallba
 def geocode_address(address: str | None):
     if not address:
         return None
-
     try:
         r = requests.get(
             "https://nominatim.openstreetmap.org/search",
-            params={
-                "q": f"{address}, Aarhus, Denmark",
-                "format": "json",
-                "limit": 1,
-            },
+            params={"q": f"{address}, Aarhus, Denmark", "format": "json", "limit": 1},
             headers={"User-Agent": USER_AGENT},
             timeout=5,
         )
@@ -367,15 +368,15 @@ def geocode_address(address: str | None):
             return float(data[0]["lat"]), float(data[0]["lon"])
     except Exception:
         return None
-
     return None
+
 
 def is_known_valid_depot_area_address(text: str | None) -> bool:
     if not text:
         return False
-
     value = text.casefold()
     return any(part in value for part in DEPOT_NEAR_ALLOWED_ADDRESS_PARTS)
+
 
 def is_too_close_to_depot(lat, lon, threshold_m=100):
     if lat is None or lon is None:
@@ -413,5 +414,4 @@ def get_company_name(cvr: str):
             return data.get("name")
     except Exception:
         return None
-
     return None
