@@ -18,9 +18,9 @@ classifiers = [
 dependencies = [
     "OpenOrchestrator == 2.*",
     "Pillow == 10.*",
-    "azure-cosmos==4.15.0"
-    "pyproj==3.7.2"
-    "regex==2026.4.4"
+    "azure-cosmos==4.15.0",
+    "pyproj==3.7.2",
+    "regex==2026.4.4",
     "requests==2.33.1"
 ]
 
