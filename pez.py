@@ -170,36 +170,7 @@ def fetch_pez_cases(orchestrator_connection, session: requests.Session, username
             "start_date": start_date,
         })
 
-    return cases, access_token
-
-
-def add_sent_to_tilsyn_comment(session: requests.Session, access_token: str, case_uuid: str, forseelser: list[dict]) -> None:
-    parts = []
-    for f in sorted(forseelser, key=lambda x: x.get("nummer", 0)):
-        text = (f.get("text") or "").strip()
-        if text and not text.endswith("."):
-            text += "."
-        parts.append(f"Afvigelse {f['nummer']}: {text}")
-
-    payload = {
-        "comment": f"Sendt til AAK Tilsyn -> {' | '.join(parts)}",
-        "isInternal": True,
-    }
-
-    r = session.post(
-        f"https://pez.giantleap.net/rest/tickets/cases/{case_uuid}/comments",
-        headers={
-            "accept": "application/json, text/plain, */*",
-            "authorization": f"Bearer {access_token}",
-            "content-type": "application/json;charset=UTF-8",
-            "priority": "u=1, i",
-            "x-bpid": "bp_aarhus",
-            "x-gltlocale": "da",
-        },
-        json=payload,
-        timeout=30,
-    )
-    r.raise_for_status()
+    return cases
 
 
 def login(session: requests.Session, username: str, password: str) -> str:

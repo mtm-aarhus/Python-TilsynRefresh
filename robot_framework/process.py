@@ -11,7 +11,7 @@ import requests
 from azure.cosmos import CosmosClient
 from azure.cosmos.exceptions import CosmosResourceNotFoundError
 
-from pez import fetch_pez_cases, add_sent_to_tilsyn_comment
+from pez import fetch_pez_cases
 from vejman import fetch_vejman_cases
 
 
@@ -61,7 +61,7 @@ def process(orchestrator_connection: OrchestratorConnection, queue_element: Queu
     # -------------------------
     # PEZ / henstillinger
     # -------------------------
-    pez_cases, pez_access_token = fetch_pez_cases(
+    pez_cases = fetch_pez_cases(
         orchestrator_connection=orchestrator_connection,
         session=session,
         username=pez_username,
@@ -175,13 +175,6 @@ def process(orchestrator_connection: OrchestratorConnection, queue_element: Queu
                 created += 1
                 case_created_new_rows = True
 
-        if not case_had_existing_rows and case_created_new_rows:
-            add_sent_to_tilsyn_comment(
-                session=session,
-                access_token=pez_access_token,
-                case_uuid=case["case_uuid"],
-                forseelser=case["forseelser"],
-            )
 
     # -------------------------
     # Vejman / permissions
