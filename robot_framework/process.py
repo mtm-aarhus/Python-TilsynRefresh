@@ -6,18 +6,24 @@ from math import radians, cos, sin, asin, sqrt
 import hashlib
 import json
 import re
+import urllib.parse
 
+import pyodbc
 import requests
 from azure.cosmos import CosmosClient
 from azure.cosmos.exceptions import CosmosResourceNotFoundError
+from office365.sharepoint.client_context import ClientContext
 
 from pez import fetch_pez_cases
 from vejman import fetch_vejman_cases
 
 
+
 CVR_API_URL = "https://cvrapi.dk/api"
 USER_AGENT = "AAK Tilsyn"
 DEPOT = (56.161147, 10.13455)
+SHAREPOINT_TOP_FOLDER = "Delte dokumenter/Tilladelser"
+SHAREPOINT_LINK_BASE = "https://aarhuskommune.sharepoint.com/Teams/tea-teamsite10014/Delte%20dokumenter/Tilladelser"
 
 DEPOT_NEAR_ALLOWED_ADDRESS_PARTS = [
     "karen blixens",
@@ -53,6 +59,28 @@ def process(orchestrator_connection: OrchestratorConnection, queue_element: Queu
         "sec-ch-ua-platform": '"Windows"',
         "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36 Edg/145.0.0.0",
     })
+
+    # --- SQL Server (for VejmanTilladelser SharePoint tracking) ---
+    sql_server = orchestrator_connection.get_constant("SqlServer")
+    sql_conn = pyodbc.connect(
+        f"DRIVER={{SQL Server}};SERVER={sql_server.value};DATABASE=PYORCHESTRATOR;Trusted_Connection=yes;"
+    )
+    sql_cursor = sql_conn.cursor()
+
+    # --- SharePoint client (for folder creation) ---
+    sharepoint_site_base = orchestrator_connection.get_constant("AarhusKommuneSharePoint").value
+    sharepoint_site = f"{sharepoint_site_base}/teams/tea-teamsite10014"
+    sp_cert = orchestrator_connection.get_credential("SharePointCert")
+    sp_api = orchestrator_connection.get_credential("SharePointAPI")
+    sp_ctx = ClientContext(sharepoint_site).with_client_certificate(
+        tenant=sp_api.username,
+        client_id=sp_api.password,
+        thumbprint=sp_cert.username,
+        cert_path=sp_cert.password,
+    )
+    sp_ctx.load(sp_ctx.web)
+    sp_ctx.execute_query()
+    orchestrator_connection.log_trace(f"SharePoint connected: {sp_ctx.web.properties['Title']}")
 
     created = 0
     updated = 0
@@ -189,6 +217,7 @@ def process(orchestrator_connection: OrchestratorConnection, queue_element: Queu
 
     for case in vejman_cases:
         doc_id = case["case_id"]
+        case_number = case["case_number"]
 
         try:
             existing = container.read_item(item=doc_id, partition_key=doc_id)
@@ -214,9 +243,16 @@ def process(orchestrator_connection: OrchestratorConnection, queue_element: Queu
                 fallback_lon=existing.get("longitude") if existing else None,
             )
 
+        # --- SharePoint folder + link ---
+        # Use street_name_raw (unmodified from Vejman API) to match dispatcher folder naming
+        sharepoint_link = ensure_sharepoint_folder(
+            orchestrator_connection, sp_ctx, sql_cursor, sql_conn,
+            doc_id, case_number, case.get("street_name_raw") or "Intet vejnavn",
+        )
+
         content_hash = make_hash({
             "type": "permission",
-            "case_number": case["case_number"],
+            "case_number": case_number,
             "case_id": case["case_id"],
             "vejman_state": case["vejman_state"],
             "connected_case": case["connected_case"],
@@ -229,12 +265,12 @@ def process(orchestrator_connection: OrchestratorConnection, queue_element: Queu
         })
 
         if existing:
-            if existing.get("content_hash") == content_hash:
+            if existing.get("content_hash") == content_hash and existing.get("sharepoint_link") == sharepoint_link:
                 unchanged += 1
                 continue
 
             sync_fields = {
-                "case_number": case["case_number"],
+                "case_number": case_number,
                 "case_id": case["case_id"],
                 "vejman_state": case["vejman_state"],
                 "connected_case": case["connected_case"],
@@ -251,6 +287,7 @@ def process(orchestrator_connection: OrchestratorConnection, queue_element: Queu
                 "initials": case["initials"],
                 "latitude": latitude,
                 "longitude": longitude,
+                "sharepoint_link": sharepoint_link,
                 "location_hash": location_hash,
                 "content_hash": content_hash,
             }
@@ -262,7 +299,7 @@ def process(orchestrator_connection: OrchestratorConnection, queue_element: Queu
             doc = {
                 "id": doc_id,
                 "type": "permission",
-                "case_number": case["case_number"],
+                "case_number": case_number,
                 "case_id": case["case_id"],
                 "vejman_state": case["vejman_state"],
                 "connected_case": case["connected_case"],
@@ -279,11 +316,15 @@ def process(orchestrator_connection: OrchestratorConnection, queue_element: Queu
                 "initials": case["initials"],
                 "latitude": latitude,
                 "longitude": longitude,
+                "sharepoint_link": sharepoint_link,
                 "location_hash": location_hash,
                 "content_hash": content_hash,
             }
             container.upsert_item(body=doc)
             created += 1
+
+    sql_cursor.close()
+    sql_conn.close()
 
     orchestrator_connection.log_info(
         f"Unified sync done. Created={created}, Updated={updated}, Unchanged={unchanged}"
@@ -295,7 +336,6 @@ def patch_in_batches(container, doc_id: str, fields: dict):
     Cosmos limits patch to 10 operations per call, so we batch.
     content_hash is always placed in the last batch — if an earlier
     batch fails, the old hash remains and the next sync retries."""
-    from azure.cosmos import PatchOperations
 
     # Ensure content_hash goes last
     items = [(k, v) for k, v in fields.items() if k != "content_hash"]
@@ -304,9 +344,7 @@ def patch_in_batches(container, doc_id: str, fields: dict):
 
     for i in range(0, len(items), 10):
         batch = items[i:i + 10]
-        ops = PatchOperations()
-        for key, value in batch:
-            ops.set(f"/{key}", value)
+        ops = [{"op": "set", "path": f"/{key}", "value": value} for key, value in batch]
         container.patch_item(item=doc_id, partition_key=doc_id, patch_operations=ops)
 
 
@@ -391,6 +429,85 @@ def haversine(coord1, coord2):
 def make_hash(data: dict) -> str:
     raw = json.dumps(data, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+# ─── SharePoint helpers ──────────────────────────────────────────────────────
+
+def sanitize_folder_name(folder_name: str) -> str:
+    """Remove SharePoint-illegal characters. Must match VejmanDispatcher logic."""
+    pattern = r'[~#%&*{}\[\]\\:<>?/+|$¤£€\"\t]'
+    folder_name = re.sub(pattern, "", folder_name)
+    folder_name = re.sub(r"\s+", " ", folder_name).strip()
+    return folder_name
+
+
+def build_sharepoint_link(vejnavn: str, case_number: str) -> str:
+    """Build the full SharePoint URL for a permission folder."""
+    folder_name = sanitize_folder_name(vejnavn.replace(".", "") + "_" + case_number)
+    return f"{SHAREPOINT_LINK_BASE}/{urllib.parse.quote(folder_name)}"
+
+
+def ensure_sharepoint_folder(
+    orchestrator_connection,
+    sp_ctx: ClientContext,
+    sql_cursor,
+    sql_conn,
+    case_id: str,
+    case_number: str,
+    vejnavn: str,
+) -> str:
+    """Return the SharePoint link for a permission case.
+    If the case already exists in SQL, use whatever folder path is stored there.
+    If it's new, create the folder + SQL row + queue element.
+    Renames are left to the daily VejmanDispatcher.
+    """
+    sql_cursor.execute(
+        "SELECT SharePointFolder FROM [dbo].[VejmanTilladelser] WHERE ID = ?",
+        (case_id,),
+    )
+    row = sql_cursor.fetchone()
+
+    if row:
+        # Already tracked — use the existing folder path from SQL as-is
+        existing_folder = row[0]
+        folder_name = existing_folder.rsplit("/", 1)[-1]
+        payload = json.dumps({
+        "case_id": case_id,
+        "case_number": case_number,
+        "sharepoint_folder": f"{SHAREPOINT_TOP_FOLDER}/{folder_name}",
+        }, ensure_ascii=False)
+        orchestrator_connection.create_queue_element("VejmanPerformer", reference=case_number, data=payload)
+
+        return f"{SHAREPOINT_LINK_BASE}/{urllib.parse.quote(folder_name)}"
+
+    # New case — create folder + SQL row + queue element
+    vejnavn_clean = (vejnavn or "Intet vejnavn angivet").replace(".", "")
+    folder_name = sanitize_folder_name(vejnavn_clean + "_" + case_number)
+    folder_path = f"{SHAREPOINT_TOP_FOLDER}/{folder_name}"
+
+    try:
+        top = sp_ctx.web.get_folder_by_server_relative_url(SHAREPOINT_TOP_FOLDER)
+        sp_ctx.load(top)
+        sp_ctx.execute_query()
+        top.folders.add(folder_name).execute_query()
+        orchestrator_connection.log_info(f"Created SP folder: {folder_path}")
+    except Exception as e:
+        orchestrator_connection.log_trace(f"SP folder create (may already exist): {e}")
+
+    sql_cursor.execute(
+        "INSERT INTO [dbo].[VejmanTilladelser] (ID, CaseNumber, SharePointFolder, LastUpdated) VALUES (?, ?, ?, GETDATE())",
+        (case_id, case_number, folder_path),
+    )
+    sql_conn.commit()
+
+    payload = json.dumps({
+        "case_id": case_id,
+        "case_number": case_number,
+        "sharepoint_folder": folder_path,
+    }, ensure_ascii=False)
+    orchestrator_connection.create_queue_element("VejmanPerformer", reference=case_number, data=payload)
+
+    return f"{SHAREPOINT_LINK_BASE}/{urllib.parse.quote(folder_name)}"
 
 
 @lru_cache(maxsize=5000)

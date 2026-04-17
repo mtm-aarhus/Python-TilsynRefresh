@@ -118,6 +118,7 @@ def fetch_vejman_cases(orchestrator_connection, session, vejman_token: str):
             "authority_reference_number": (case.get("authority_reference_number") or "").strip() or None,
             "street_status": (site.get("street_status") or "").strip() or None,
             "full_address": full_address,
+            "street_name_raw": street_name_raw or None,  # unmodified, for SharePoint folder naming (must match dispatcher)
             "initials": (case.get("initials") or "").strip() or None,
             "source_lat": source_lat,
             "source_lon": source_lon,
