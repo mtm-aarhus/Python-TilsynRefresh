@@ -16,7 +16,7 @@ from office365.sharepoint.client_context import ClientContext
 
 from pez import fetch_pez_cases
 from vejman import fetch_vejman_cases
-
+from datetime import datetime, timedelta
 
 
 CVR_API_URL = "https://cvrapi.dk/api"
@@ -33,6 +33,11 @@ DEPOT_NEAR_ALLOWED_ADDRESS_PARTS = [
     "hejredalsvej",
 ]
 
+
+#Værdier til gentjek ved evt. forlægelse
+RECONCILE_META_ID = "sync_meta_vejman_reconcile"
+RECONCILE_GRACE_DAYS = 100  # hvor langt tilbage (fra i dag) vi gen-tjekker udløbne tilladelser
+RECONCILE_DRY_RUN = True  # True = log kun, skriv ikke til Cosmos. Sæt til False når du er tryg.
 
 def process(orchestrator_connection: OrchestratorConnection, queue_element: QueueElement | None = None) -> None:
     orchestrator_connection.log_trace("Running unified TilsynItems sync.")
@@ -326,6 +331,16 @@ def process(orchestrator_connection: OrchestratorConnection, queue_element: Queu
     sql_cursor.close()
     sql_conn.close()
 
+    # -------------------------
+    # Daglig reconcile: fang forlængelser som hente-vinduerne ikke ser
+    # -------------------------
+    try:
+        if _should_run_reconcile_today(container):
+            reconcile_permission_dates(orchestrator_connection, session, vejman_token, container)
+            _mark_reconcile_done(container)
+    except Exception as e:
+        orchestrator_connection.log_info(f"Reconcile sprunget over pga. fejl: {e}")
+
     orchestrator_connection.log_info(
         f"Unified sync done. Created={created}, Updated={updated}, Unchanged={unchanged}"
     )
@@ -525,3 +540,112 @@ def get_company_name(cvr: str):
     except Exception:
         return None
     return None
+
+def _should_run_reconcile_today(container) -> bool:
+    """Kør kun reconcile én gang pr. kalenderdag, uanset hvor mange gange
+    robotten kører. Bruger et lille meta-dokument i containeren (type='sync_meta',
+    som API'et ignorerer, ligesom counter/fcm_token-dokumenterne)."""
+    today = datetime.now().date().isoformat()
+    try:
+        meta = container.read_item(item=RECONCILE_META_ID, partition_key=RECONCILE_META_ID)
+    except CosmosResourceNotFoundError:
+        return True
+    return meta.get("last_run_date") != today
+
+
+def _mark_reconcile_done(container) -> None:
+    container.upsert_item(body={
+        "id": RECONCILE_META_ID,
+        "type": "sync_meta",
+        "last_run_date": datetime.now().date().isoformat(),
+    })
+
+def reconcile_permission_dates(orchestrator_connection, session, vejman_token: str, container) -> None:
+    """Eksisterende permission-dokumenter opdateres af hovedloopet kun mens deres
+    datoer ligger i de smalle hente-vinduer. En forlængelse skubber end_date ud i
+    fremtiden, så sagen aldrig kommer tilbage i et vindue, og den gemte end_date
+    bliver forældet (sagen står som 'udløbet' i appen). Her gen-tjekker vi hver
+    stadig-relevant tilladelse direkte mod Vejman og patcher start_date/end_date,
+    hvis de har flyttet sig. content_hash røres ikke — det er sync-ejet af
+    hovedloopet, og en evt. mismatch dér giver blot én ufarlig ekstra patch senere."""
+    cutoff = (datetime.now() - timedelta(days=RECONCILE_GRACE_DAYS)).isoformat()
+
+    query = (
+        "SELECT c.id, c.case_id, c.case_number, c.start_date, c.end_date "
+        "FROM c WHERE c.type = 'permission' AND IS_DEFINED(c.end_date) "
+        "AND c.end_date >= @cutoff"
+    )
+    docs = list(container.query_items(
+        query=query,
+        parameters=[{"name": "@cutoff", "value": cutoff}],
+        enable_cross_partition_query=True,
+    ))
+
+    orchestrator_connection.log_info(f"Reconcile: tjekker {len(docs)} tilladelse(r) mod Vejman.")
+    reconciled = 0
+    extended = 0
+
+    for doc in docs:
+        case_id = doc.get("case_id")
+        if not case_id:
+            continue
+
+        try:
+            detail_resp = session.get(
+                f"https://vejman.vd.dk/permissions/getcase?caseid={case_id}&token={vejman_token}",
+                timeout=60,
+            )
+            detail_resp.raise_for_status()
+            details = detail_resp.json().get("data", {}) or {}
+        except Exception as e:
+            orchestrator_connection.log_trace(f"Reconcile: getcase fejlede for {doc.get('case_number')}: {e}")
+            continue
+
+        start_raw = details.get("start_date")
+        end_raw = details.get("end_date")
+
+        fresh_start = datetime.strptime(start_raw, "%d-%m-%Y %H:%M:%S").isoformat() if start_raw else None
+        fresh_end = datetime.strptime(end_raw, "%d-%m-%Y %H:%M:%S").isoformat() if end_raw else None
+
+        # Patch kun ved reel ændring, og overskriv aldrig en gemt dato med en tom værdi
+        changed = {}
+        old_start = doc.get("start_date")
+        old_end = doc.get("end_date")
+        if fresh_start and fresh_start != old_start:
+            changed["start_date"] = fresh_start
+        if fresh_end and fresh_end != old_end:
+            changed["end_date"] = fresh_end
+
+        if not changed:
+            continue
+
+        if not RECONCILE_DRY_RUN:
+            patch_in_batches(container, doc["id"], changed)
+        reconciled += 1
+        case_number = doc.get("case_number")
+
+        # ISO-8601-strenge sorterer kronologisk, så vi kan sammenligne direkte
+        if "end_date" in changed:
+            if old_end and fresh_end > old_end:
+                extended += 1
+                orchestrator_connection.log_info(
+                    f"Reconcile: FORLÆNGELSE fundet — {case_number}: slutdato {old_end} -> {fresh_end}. "
+                    f"Sagen genaktiveres i appen."
+                )
+            elif old_end and fresh_end < old_end:
+                orchestrator_connection.log_info(
+                    f"Reconcile: slutdato afkortet — {case_number}: {old_end} -> {fresh_end}."
+                )
+            else:
+                orchestrator_connection.log_info(
+                    f"Reconcile: slutdato ændret — {case_number}: {old_end} -> {fresh_end}."
+                )
+
+        if "start_date" in changed:
+            orchestrator_connection.log_info(
+                f"Reconcile: startdato ændret — {case_number}: {old_start} -> {changed['start_date']}."
+            )
+
+    orchestrator_connection.log_info(
+        f"Reconcile færdig. {len(docs)} tjekket, {reconciled} rettet, heraf {extended} forlængelse(r)."
+    )
