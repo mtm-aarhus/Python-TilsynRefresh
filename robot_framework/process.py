@@ -36,8 +36,8 @@ DEPOT_NEAR_ALLOWED_ADDRESS_PARTS = [
 
 #Værdier til gentjek ved evt. forlægelse
 RECONCILE_META_ID = "sync_meta_vejman_reconcile"
-RECONCILE_GRACE_DAYS = 100  # hvor langt tilbage (fra i dag) vi gen-tjekker udløbne tilladelser
-RECONCILE_DRY_RUN = True  # True = log kun, skriv ikke til Cosmos. Sæt til False når du er tryg.
+RECONCILE_GRACE_DAYS = 30  # hvor langt tilbage (fra i dag) vi gen-tjekker udløbne tilladelser
+RECONCILE_DRY_RUN = False  # True = log kun, skriv ikke til Cosmos. Sæt til False når du er tryg.
 
 def process(orchestrator_connection: OrchestratorConnection, queue_element: QueueElement | None = None) -> None:
     orchestrator_connection.log_trace("Running unified TilsynItems sync.")
