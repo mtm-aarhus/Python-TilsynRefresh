@@ -4,7 +4,7 @@ import re
 from pyproj import Transformer
 
 
-ALLOWED_INITIALS = {"MAMASA", "LERV", "MABMO", "JKROG"}
+ALLOWED_INITIALS = {"MAMASA", "LERV", "MABMO", "JKROG", "MOJUS"}
 EPSG25832_TO_WGS84 = Transformer.from_crs("EPSG:25832", "EPSG:4326", always_xy=True)
 
 # The middle value of each entry in the urls list below: whether a case seen only
