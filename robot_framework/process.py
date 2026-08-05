@@ -15,7 +15,7 @@ from azure.cosmos.exceptions import CosmosResourceNotFoundError
 from office365.sharepoint.client_context import ClientContext
 
 from pez import fetch_pez_cases
-from vejman import fetch_vejman_cases
+from vejman import build_vejman_case, fetch_vejman_case_list, list_level_fingerprint
 
 
 
@@ -207,22 +207,55 @@ def process(orchestrator_connection: OrchestratorConnection, queue_element: Queu
     # -------------------------
     # Vejman / permissions
     # -------------------------
-    vejman_cases = fetch_vejman_cases(
+    base_cases = fetch_vejman_case_list(
         orchestrator_connection=orchestrator_connection,
         session=session,
         vejman_token=vejman_token,
     )
 
-    orchestrator_connection.log_info(f"Vejman candidate cases: {len(vejman_cases)}")
+    orchestrator_connection.log_info(f"Vejman candidate cases: {len(base_cases)}")
 
-    for case in vejman_cases:
-        doc_id = case["case_id"]
-        case_number = case["case_number"]
+    skipped_unchanged = 0
+    skipped_not_started = 0
+    refetched_changed = 0
+
+    for base_case in base_cases:
+        doc_id = str(base_case["case_id"]).strip()
 
         try:
             existing = container.read_item(item=doc_id, partition_key=doc_id)
         except CosmosResourceNotFoundError:
             existing = None
+
+        # Fingerprint of this one case's list-level fields, from the values
+        # Vejman just returned. Nothing run-specific goes in, so an untouched
+        # case hashes identically on every run, no matter when it runs.
+        list_fields_hash = make_hash(list_level_fingerprint(base_case))
+
+        # The wide window is unfiltered on start date so that a sag whose
+        # startdato was moved forward still gets refreshed. The flip side is that
+        # it also returns sager that have not begun yet — those don't belong in
+        # the app until they do, and the "nye" window will add them on their
+        # start date. Only skip the ones we don't already hold: a case already in
+        # the app needs its new dates whether or not it has begun.
+        if base_case["refresh_only"] and not existing and base_case["not_yet_started"]:
+            skipped_not_started += 1
+            continue
+
+        # Cases from the wide "igangværende" window show up on every single run.
+        # If nothing in the list payload moved there is nothing to sync, so skip
+        # before paying for the case details — a forlængelse always moves
+        # end_date, so a real change never lands here. Cases from the narrow
+        # windows are always refetched in full, as before.
+        if base_case["refresh_only"] and existing:
+            if existing.get("list_fields_hash") == list_fields_hash:
+                skipped_unchanged += 1
+                unchanged += 1
+                continue
+            refetched_changed += 1
+
+        case = build_vejman_case(session, vejman_token, base_case)
+        case_number = case["case_number"]
 
         street_name = normalize_street_name(case["full_address"])
         location_hash = make_hash({
@@ -244,11 +277,17 @@ def process(orchestrator_connection: OrchestratorConnection, queue_element: Queu
             )
 
         # --- SharePoint folder + link ---
-        # Use street_name_raw (unmodified from Vejman API) to match dispatcher folder naming
-        sharepoint_link = ensure_sharepoint_folder(
-            orchestrator_connection, sp_ctx, sql_cursor, sql_conn,
-            doc_id, case_number, case.get("street_name_raw") or "Intet vejnavn",
-        )
+        if existing and base_case["refresh_only"]:
+            # Folder already exists and the dispatcher owns renames. Only the
+            # dates moved, so don't hand VejmanPerformer the case again — that
+            # would mean a queue element per active permission per run.
+            sharepoint_link = lookup_sharepoint_link(sql_cursor, doc_id) or existing.get("sharepoint_link")
+        else:
+            # Use street_name_raw (unmodified from Vejman API) to match dispatcher folder naming
+            sharepoint_link = ensure_sharepoint_folder(
+                orchestrator_connection, sp_ctx, sql_cursor, sql_conn,
+                doc_id, case_number, case.get("street_name_raw") or "Intet vejnavn",
+            )
 
         content_hash = make_hash({
             "type": "permission",
@@ -258,6 +297,8 @@ def process(orchestrator_connection: OrchestratorConnection, queue_element: Queu
             "connected_case": case["connected_case"],
             "start_date": case["start_date"],
             "end_date": case["end_date"],
+            "completion_date": case["completion_date"],
+            "vejman_end_date": case["vejman_end_date"],
             "applicant": case["applicant"],
             "rovm_equipment_type": case["rovm_equipment_type"],
             "full_address": case["full_address"],
@@ -266,6 +307,11 @@ def process(orchestrator_connection: OrchestratorConnection, queue_element: Queu
 
         if existing:
             if existing.get("content_hash") == content_hash and existing.get("sharepoint_link") == sharepoint_link:
+                # Nothing we store changed, but a field that only lives in the
+                # list payload may have. Record the new list_fields_hash so we don't
+                # refetch the details of this case on every future run.
+                if existing.get("list_fields_hash") != list_fields_hash:
+                    patch_in_batches(container, doc_id, {"list_fields_hash": list_fields_hash})
                 unchanged += 1
                 continue
 
@@ -276,6 +322,8 @@ def process(orchestrator_connection: OrchestratorConnection, queue_element: Queu
                 "connected_case": case["connected_case"],
                 "start_date": case["start_date"],
                 "end_date": case["end_date"],
+                "completion_date": case["completion_date"],
+                "vejman_end_date": case["vejman_end_date"],
                 "applicant": case["applicant"],
                 "marker": case["marker"],
                 "rovm_equipment_type": case["rovm_equipment_type"],
@@ -289,6 +337,7 @@ def process(orchestrator_connection: OrchestratorConnection, queue_element: Queu
                 "longitude": longitude,
                 "sharepoint_link": sharepoint_link,
                 "location_hash": location_hash,
+                "list_fields_hash": list_fields_hash,
                 "content_hash": content_hash,
             }
 
@@ -305,6 +354,8 @@ def process(orchestrator_connection: OrchestratorConnection, queue_element: Queu
                 "connected_case": case["connected_case"],
                 "start_date": case["start_date"],
                 "end_date": case["end_date"],
+                "completion_date": case["completion_date"],
+                "vejman_end_date": case["vejman_end_date"],
                 "applicant": case["applicant"],
                 "marker": case["marker"],
                 "rovm_equipment_type": case["rovm_equipment_type"],
@@ -318,6 +369,7 @@ def process(orchestrator_connection: OrchestratorConnection, queue_element: Queu
                 "longitude": longitude,
                 "sharepoint_link": sharepoint_link,
                 "location_hash": location_hash,
+                "list_fields_hash": list_fields_hash,
                 "content_hash": content_hash,
             }
             container.upsert_item(body=doc)
@@ -326,8 +378,15 @@ def process(orchestrator_connection: OrchestratorConnection, queue_element: Queu
     sql_cursor.close()
     sql_conn.close()
 
+    # refetched_changed should be small on a normal day — it counts already-known
+    # igangværende tilladelser where something in the list payload moved. If it
+    # stays high every single run, a field in CASE_FINGERPRINT_FIELDS is volatile
+    # and should be dropped from the fingerprint.
     orchestrator_connection.log_info(
-        f"Unified sync done. Created={created}, Updated={updated}, Unchanged={unchanged}"
+        f"Unified sync done. Created={created}, Updated={updated}, Unchanged={unchanged}. "
+        f"Igangværende: {skipped_unchanged} uændret (sprunget over), "
+        f"{refetched_changed} ændret (hentet igen), "
+        f"{skipped_not_started} ikke begyndt endnu (ikke oprettet)"
     )
 
 
@@ -444,6 +503,21 @@ def sanitize_folder_name(folder_name: str) -> str:
 def build_sharepoint_link(vejnavn: str, case_number: str) -> str:
     """Build the full SharePoint URL for a permission folder."""
     folder_name = sanitize_folder_name(vejnavn.replace(".", "") + "_" + case_number)
+    return f"{SHAREPOINT_LINK_BASE}/{urllib.parse.quote(folder_name)}"
+
+
+def lookup_sharepoint_link(sql_cursor, case_id: str) -> str | None:
+    """Return the SharePoint link for an already-tracked case, without touching
+    SharePoint or the VejmanPerformer queue. None if the case isn't tracked yet."""
+    sql_cursor.execute(
+        "SELECT SharePointFolder FROM [dbo].[VejmanTilladelser] WHERE ID = ?",
+        (case_id,),
+    )
+    row = sql_cursor.fetchone()
+    if not row or not row[0]:
+        return None
+
+    folder_name = row[0].rsplit("/", 1)[-1]
     return f"{SHAREPOINT_LINK_BASE}/{urllib.parse.quote(folder_name)}"
 
 
