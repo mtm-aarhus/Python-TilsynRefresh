@@ -220,6 +220,7 @@ def build_vejman_case(session, vejman_token: str, case: dict) -> dict:
     completion_date = parse_vejman_datetime(details.get("completion_date") or case.get("completion_date"))
 
     return {
+        "is_parklet": is_parklet(details),
         "case_number": (case.get("case_number") or "").strip(),
         "case_id": str(case_id).strip(),
         "vejman_state": (case.get("state") or "").strip() or None,
@@ -240,6 +241,30 @@ def build_vejman_case(session, vejman_token: str, case: dict) -> dict:
         "source_lat": source_lat,
         "source_lon": source_lon,
     }
+
+
+def is_parklet(details: dict) -> bool:
+    """Whether the case's equipment includes a parklet.
+
+    Vejman has no type of its own for parklets: they are registered as udstyr
+    of type "Andet" with "Parklet" in the description. That is free text, so it
+    is trimmed and compared without regard to case. The app leaves parklets off
+    the weekly inspection list from October to March (TilsynAPI decides that).
+    """
+    rovm = (details or {}).get("rovm")
+    equipment = rovm.get("equipment") if isinstance(rovm, dict) else None
+    for row in equipment if isinstance(equipment, list) else []:
+        if not isinstance(row, dict):
+            continue
+        kind = row.get("type")
+        kind = kind.get("value") if isinstance(kind, dict) else kind
+        if _folded(kind) == "andet" and _folded(row.get("description")) == "parklet":
+            return True
+    return False
+
+
+def _folded(value) -> str:
+    return str(value or "").strip().casefold()
 
 
 def effective_end_date(slutdato, completion_date):

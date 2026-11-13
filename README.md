@@ -39,7 +39,19 @@ Fetches road permission cases from the Vejman API (vejman.vd.dk):
 2. Deduplicates by case number and filters to cases belonging to allowed caseworkers (by initials).
 3. For each case, fetches the detail view to get site/building info for a more precise address.
 4. Extracts coordinates from LINESTRING geometry data and converts from EPSG:25832 (UTM zone 32N) to WGS84 (lat/lon).
-5. Returns a list of cases with address, coordinates, applicant, equipment type, dates, and case metadata.
+5. Marks parklets (`is_parklet`): Vejman has no type for them, so a parklet is udstyr of type `Andet` whose free-text description is `Parklet` (trimmed, case ignored). TilsynAPI leaves parklets off the app's weekly inspection list from October to March.
+6. Returns a list of cases with address, coordinates, applicant, equipment type, dates, and case metadata.
+
+A permission stored before parklets were recognised has no `is_parklet` yet, so the first run after that change fetches the details of every igangværende tilladelse once (logged as "hentet igen for at se, om de er parkletter").
+
+## Tests
+
+Pure parts only (`vejman.py`), no OpenOrchestrator, Vejman, Cosmos or SharePoint. Set up `tests/.venv` once, then run from the repo root:
+
+```
+py -3 tests\opsaet_testmiljoe.py
+tests\.venv\Scripts\python.exe -m unittest discover -s tests -t .
+```
 
 ---
 

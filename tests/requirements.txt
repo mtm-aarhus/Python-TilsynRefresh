@@ -1,0 +1,4 @@
+# What the tests need. They test vejman.py without OpenOrchestrator, Vejman,
+# Cosmos or SharePoint; vejman.py itself imports pyproj (the same pin as
+# pyproject.toml). Installed into tests/.venv by tests/opsaet_testmiljoe.py.
+pyproj==3.7.2

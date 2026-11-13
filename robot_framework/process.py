@@ -218,6 +218,7 @@ def process(orchestrator_connection: OrchestratorConnection, queue_element: Queu
     skipped_unchanged = 0
     skipped_not_started = 0
     refetched_changed = 0
+    refetched_for_parklet = 0
 
     for base_case in base_cases:
         doc_id = str(base_case["case_id"]).strip()
@@ -247,12 +248,19 @@ def process(orchestrator_connection: OrchestratorConnection, queue_element: Queu
         # before paying for the case details — a forlængelse always moves
         # end_date, so a real change never lands here. Cases from the narrow
         # windows are always refetched in full, as before.
+        #
+        # Whether a case is a parklet is only in the case details. A case stored
+        # before the robot looked for parklets has no is_parklet yet, so it is
+        # fetched in full once, even when nothing else moved.
         if base_case["refresh_only"] and existing:
             if existing.get("list_fields_hash") == list_fields_hash:
-                skipped_unchanged += 1
-                unchanged += 1
-                continue
-            refetched_changed += 1
+                if "is_parklet" in existing:
+                    skipped_unchanged += 1
+                    unchanged += 1
+                    continue
+                refetched_for_parklet += 1
+            else:
+                refetched_changed += 1
 
         case = build_vejman_case(session, vejman_token, base_case)
         case_number = case["case_number"]
@@ -301,6 +309,7 @@ def process(orchestrator_connection: OrchestratorConnection, queue_element: Queu
             "vejman_end_date": case["vejman_end_date"],
             "applicant": case["applicant"],
             "rovm_equipment_type": case["rovm_equipment_type"],
+            "is_parklet": case["is_parklet"],
             "full_address": case["full_address"],
             "location_hash": location_hash,
         })
@@ -327,6 +336,7 @@ def process(orchestrator_connection: OrchestratorConnection, queue_element: Queu
                 "applicant": case["applicant"],
                 "marker": case["marker"],
                 "rovm_equipment_type": case["rovm_equipment_type"],
+                "is_parklet": case["is_parklet"],
                 "applicant_folder_number": case["applicant_folder_number"],
                 "authority_reference_number": case["authority_reference_number"],
                 "street_status": case["street_status"],
@@ -359,6 +369,7 @@ def process(orchestrator_connection: OrchestratorConnection, queue_element: Queu
                 "applicant": case["applicant"],
                 "marker": case["marker"],
                 "rovm_equipment_type": case["rovm_equipment_type"],
+                "is_parklet": case["is_parklet"],
                 "applicant_folder_number": case["applicant_folder_number"],
                 "authority_reference_number": case["authority_reference_number"],
                 "street_status": case["street_status"],
@@ -382,10 +393,13 @@ def process(orchestrator_connection: OrchestratorConnection, queue_element: Queu
     # igangværende tilladelser where something in the list payload moved. If it
     # stays high every single run, a field in CASE_FINGERPRINT_FIELDS is volatile
     # and should be dropped from the fingerprint.
+    # refetched_for_parklet is only high on the first run after parklets were
+    # added: every igangværende tilladelse is fetched once to learn is_parklet.
     orchestrator_connection.log_info(
         f"Unified sync done. Created={created}, Updated={updated}, Unchanged={unchanged}. "
         f"Igangværende: {skipped_unchanged} uændret (sprunget over), "
         f"{refetched_changed} ændret (hentet igen), "
+        f"{refetched_for_parklet} hentet igen for at se, om de er parkletter, "
         f"{skipped_not_started} ikke begyndt endnu (ikke oprettet)"
     )
 
